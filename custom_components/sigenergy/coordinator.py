@@ -15,6 +15,7 @@ from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
 )
+from homeassistant.util import dt as dt_util
 
 from .api import (
     SigenergyApi,
@@ -40,6 +41,80 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# Cumulative energy counters (used by TOTAL_INCREASING sensors) mapped to the
+# period at which they are legitimately allowed to reset to a lower value.
+# `None` means the counter is lifetime and must never decrease.
+# The cloud API occasionally returns a corrupted reading (e.g. the value
+# divided by 100) for these fields; because TOTAL_INCREASING sensors treat
+# any drop as a meter reset, a single bad sample permanently corrupts HA's
+# long-term statistics unless it is filtered out before being stored.
+_CUMULATIVE_ENERGY_RESET_PERIOD: dict[str, str | None] = {
+    "dailyPowerGeneration": "daily",
+    "monthlyPowerGeneration": "monthly",
+    "annualPowerGeneration": "annual",
+    "lifetimePowerGeneration": None,
+    "pvEnergyDaily": "daily",
+    "pvEnergyTotal": None,
+    "esChargingDay": "daily",
+    "esDischargingDay": "daily",
+    "esDischargingTotal": None,
+}
+
+# A drop below this fraction of the previous value is treated as an
+# implausible glitch rather than a genuine counter reset.
+_GLITCH_DROP_RATIO = 0.5
+
+
+def _within_reset_window(period: str | None, now: datetime.datetime) -> bool:
+    """Return True if `now` is within the expected reset window for `period`."""
+    if period is None:
+        return False
+    local = dt_util.as_local(now)
+    if local.hour != 0 or local.minute >= 10:
+        return False  # resets only happen in the first minutes after local midnight
+    if period == "daily":
+        return True
+    if period == "monthly":
+        return local.day == 1
+    if period == "annual":
+        return local.month == 1 and local.day == 1
+    return False
+
+
+def _sanitize_cumulative_values(
+    new_data: dict[str, Any],
+    prev_data: dict[str, Any],
+    now: datetime.datetime,
+) -> dict[str, Any]:
+    """Discard implausible drops in cumulative energy counters.
+
+    Keeps the previous value for a field if the new reading dropped well
+    below the last known value outside of its expected reset window.
+    """
+    for key, period in _CUMULATIVE_ENERGY_RESET_PERIOD.items():
+        if key not in new_data or key not in prev_data:
+            continue
+        try:
+            new_value = float(new_data[key])
+            old_value = float(prev_data[key])
+        except (TypeError, ValueError):
+            continue
+        if old_value <= 0:
+            continue
+        if new_value < old_value * _GLITCH_DROP_RATIO and not _within_reset_window(
+            period, now
+        ):
+            _LOGGER.warning(
+                "Ignoring implausible reading for %s: %s -> %s "
+                "(keeping previous value; likely a transient API glitch)",
+                key,
+                old_value,
+                new_value,
+            )
+            new_data[key] = prev_data[key]
+    return new_data
+
 
 class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Coordinator to manage fetching Sigenergy data from the cloud API."""
@@ -167,6 +242,7 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         try:
             result: dict[str, Any] = {"systems": {}}
+            now = datetime.datetime.now(datetime.timezone.utc)
 
             for system in self.systems:
                 system_id = system["systemId"]
@@ -182,13 +258,16 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
                 # ── System-level realtime data ────────────────────
                 try:
-                    system_data["summary"] = await self.api.get_realtime_summary(
-                        system_id
+                    system_data["summary"] = _sanitize_cumulative_values(
+                        await self.api.get_realtime_summary(system_id),
+                        prev.get("summary", {}),
+                        now,
                     )
                 except SigenergyTransientError:
                     system_data["summary"] = prev.get("summary", {})
                 except SigenergyApiError as err:
                     _LOGGER.debug("Error fetching summary for %s: %s", system_id, err)
+                    system_data["summary"] = prev.get("summary", {})
 
                 try:
                     system_data["energy_flow"] = await self.api.get_energy_flow(
@@ -200,6 +279,7 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     _LOGGER.debug(
                         "Error fetching energy flow for %s: %s", system_id, err
                     )
+                    system_data["energy_flow"] = prev.get("energy_flow", {})
 
                 # ── Operating mode ────────────────────────────────
                 try:
@@ -212,6 +292,7 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     _LOGGER.debug(
                         "Error fetching operating mode for %s: %s", system_id, err
                     )
+                    system_data["operating_mode"] = prev.get("operating_mode")
 
                 # ── Device-level realtime data ────────────────────
                 prev_devices = prev.get("devices", {})
@@ -222,9 +303,16 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         device_data = await self.api.get_device_realtime(
                             system_id, serial
                         )
+                        prev_realtime = prev_devices.get(serial, {}).get(
+                            "realtime", {}
+                        )
                         system_data["devices"][serial] = {
                             "info": device,
-                            "realtime": device_data.get("realTimeInfo", {}),
+                            "realtime": _sanitize_cumulative_values(
+                                device_data.get("realTimeInfo", {}),
+                                prev_realtime,
+                                now,
+                            ),
                         }
                     except SigenergyTransientError:
                         if serial in prev_devices:
@@ -233,10 +321,12 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         _LOGGER.debug(
                             "Error fetching device %s data: %s", serial, err
                         )
+                        if serial in prev_devices:
+                            system_data["devices"][serial] = prev_devices[serial]
 
                 result["systems"][system_id] = system_data
 
-            result["last_updated"] = datetime.datetime.now(datetime.timezone.utc)
+            result["last_updated"] = now
             return result
 
         except SigenergyAuthError as err:
