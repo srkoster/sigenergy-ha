@@ -68,6 +68,22 @@ _GLITCH_DROP_RATIO = 0.5
 
 _STORAGE_VERSION = 1
 
+# 0xFFFFFFFF at the API's decimal scales; Sigenergy uses it to mean "not available".
+_INVALID_SENTINELS = frozenset({4294967295.0, 429496729.5, 42949672.95, 4294967.295})
+
+
+def _is_sentinel(value: Any) -> bool:
+    """Return True if `value` is the API's "not available" marker."""
+    try:
+        return float(value) in _INVALID_SENTINELS
+    except (TypeError, ValueError):
+        return False
+
+
+def _strip_sentinels(data: dict[str, Any]) -> dict[str, Any]:
+    """Replace "not available" markers with None."""
+    return {k: None if _is_sentinel(v) else v for k, v in data.items()}
+
 
 def _period_changed(
     period: str | None, last: datetime.datetime, now: datetime.datetime
@@ -116,6 +132,7 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         now: datetime.datetime,
     ) -> dict[str, Any]:
         """Replace implausible drops in cumulative counters with the last known-good value."""
+        new_data = _strip_sentinels(new_data)
         for key, period in _CUMULATIVE_ENERGY_RESET_PERIOD.items():
             if key not in new_data:
                 continue
@@ -173,7 +190,11 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         installation_id = self.config_entry.data.get(CONF_INSTALLATION_ID)
         cached_systems = self.config_entry.data.get(CONF_CACHED_SYSTEMS)
         cached_devices = self.config_entry.data.get(CONF_CACHED_DEVICES, {})
-        self._last_good = await self._store.async_load() or {}
+        self._last_good = {
+            k: v
+            for k, v in (await self._store.async_load() or {}).items()
+            if not _is_sentinel(v.get("value"))
+        }
 
         try:
             if installation_id:
@@ -278,8 +299,8 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     system_data["summary"] = prev.get("summary", {})
 
                 try:
-                    system_data["energy_flow"] = await self.api.get_energy_flow(
-                        system_id
+                    system_data["energy_flow"] = _strip_sentinels(
+                        await self.api.get_energy_flow(system_id)
                     )
                 except SigenergyTransientError:
                     system_data["energy_flow"] = prev.get("energy_flow", {})
