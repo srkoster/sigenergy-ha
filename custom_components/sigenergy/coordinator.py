@@ -11,6 +11,7 @@ from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
@@ -65,55 +66,24 @@ _CUMULATIVE_ENERGY_RESET_PERIOD: dict[str, str | None] = {
 # implausible glitch rather than a genuine counter reset.
 _GLITCH_DROP_RATIO = 0.5
 
+_STORAGE_VERSION = 1
 
-def _within_reset_window(period: str | None, now: datetime.datetime) -> bool:
-    """Return True if `now` is within the expected reset window for `period`."""
+
+def _period_changed(
+    period: str | None, last: datetime.datetime, now: datetime.datetime
+) -> bool:
+    """Return True if a reset boundary for `period` lies between `last` and `now`."""
     if period is None:
         return False
-    local = dt_util.as_local(now)
-    if local.hour != 0 or local.minute >= 10:
-        return False  # resets only happen in the first minutes after local midnight
+    a = dt_util.as_local(last)
+    b = dt_util.as_local(now)
     if period == "daily":
-        return True
+        return a.date() != b.date()
     if period == "monthly":
-        return local.day == 1
+        return (a.year, a.month) != (b.year, b.month)
     if period == "annual":
-        return local.month == 1 and local.day == 1
+        return a.year != b.year
     return False
-
-
-def _sanitize_cumulative_values(
-    new_data: dict[str, Any],
-    prev_data: dict[str, Any],
-    now: datetime.datetime,
-) -> dict[str, Any]:
-    """Discard implausible drops in cumulative energy counters.
-
-    Keeps the previous value for a field if the new reading dropped well
-    below the last known value outside of its expected reset window.
-    """
-    for key, period in _CUMULATIVE_ENERGY_RESET_PERIOD.items():
-        if key not in new_data or key not in prev_data:
-            continue
-        try:
-            new_value = float(new_data[key])
-            old_value = float(prev_data[key])
-        except (TypeError, ValueError):
-            continue
-        if old_value <= 0:
-            continue
-        if new_value < old_value * _GLITCH_DROP_RATIO and not _within_reset_window(
-            period, now
-        ):
-            _LOGGER.warning(
-                "Ignoring implausible reading for %s: %s -> %s "
-                "(keeping previous value; likely a transient API glitch)",
-                key,
-                old_value,
-                new_value,
-            )
-            new_data[key] = prev_data[key]
-    return new_data
 
 
 class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -133,6 +103,43 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.api = self._create_api(hass, entry)
         self.systems: list[dict[str, Any]] = []
         self.devices: dict[str, list[dict[str, Any]]] = {}
+        # Persisted so validation survives HA restarts and data gaps.
+        self._store: Store[dict[str, dict[str, Any]]] = Store(
+            hass, _STORAGE_VERSION, f"{DOMAIN}.{entry.entry_id}.last_good"
+        )
+        self._last_good: dict[str, dict[str, Any]] = {}
+
+    def _sanitize_cumulative_values(
+        self,
+        scope: str,
+        new_data: dict[str, Any],
+        now: datetime.datetime,
+    ) -> dict[str, Any]:
+        """Replace implausible drops in cumulative counters with the last known-good value."""
+        for key, period in _CUMULATIVE_ENERGY_RESET_PERIOD.items():
+            if key not in new_data:
+                continue
+            try:
+                new_value = float(new_data[key])
+            except (TypeError, ValueError):
+                continue
+            store_key = f"{scope}:{key}"
+            last = self._last_good.get(store_key)
+            if last is not None and new_value < last["value"] * _GLITCH_DROP_RATIO:
+                last_ts = dt_util.parse_datetime(last["ts"])
+                if last_ts is not None and not _period_changed(period, last_ts, now):
+                    _LOGGER.warning(
+                        "Ignoring implausible reading for %s (%s): %s -> %s "
+                        "(keeping last known-good value)",
+                        key,
+                        scope,
+                        last["value"],
+                        new_value,
+                    )
+                    new_data[key] = last["value"]
+                    continue
+            self._last_good[store_key] = {"value": new_value, "ts": now.isoformat()}
+        return new_data
 
     @staticmethod
     def _create_api(
@@ -166,6 +173,7 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         installation_id = self.config_entry.data.get(CONF_INSTALLATION_ID)
         cached_systems = self.config_entry.data.get(CONF_CACHED_SYSTEMS)
         cached_devices = self.config_entry.data.get(CONF_CACHED_DEVICES, {})
+        self._last_good = await self._store.async_load() or {}
 
         try:
             if installation_id:
@@ -258,9 +266,9 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
                 # ── System-level realtime data ────────────────────
                 try:
-                    system_data["summary"] = _sanitize_cumulative_values(
+                    system_data["summary"] = self._sanitize_cumulative_values(
+                        system_id,
                         await self.api.get_realtime_summary(system_id),
-                        prev.get("summary", {}),
                         now,
                     )
                 except SigenergyTransientError:
@@ -303,14 +311,11 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         device_data = await self.api.get_device_realtime(
                             system_id, serial
                         )
-                        prev_realtime = prev_devices.get(serial, {}).get(
-                            "realtime", {}
-                        )
                         system_data["devices"][serial] = {
                             "info": device,
-                            "realtime": _sanitize_cumulative_values(
+                            "realtime": self._sanitize_cumulative_values(
+                                f"{system_id}:{serial}",
                                 device_data.get("realTimeInfo", {}),
-                                prev_realtime,
                                 now,
                             ),
                         }
@@ -326,6 +331,7 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
                 result["systems"][system_id] = system_data
 
+            self._store.async_delay_save(lambda: self._last_good, 60)
             result["last_updated"] = now
             return result
 
