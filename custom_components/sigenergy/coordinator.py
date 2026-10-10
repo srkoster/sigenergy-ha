@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import timedelta
 import datetime
 import logging
+import math
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -85,6 +86,17 @@ def _strip_sentinels(data: dict[str, Any]) -> dict[str, Any]:
     return {k: None if _is_sentinel(v) else v for k, v in data.items()}
 
 
+def _valid_energy_value(value: Any) -> float | None:
+    """Return a finite, nonnegative energy reading, excluding sentinel values."""
+    if isinstance(value, bool) or _is_sentinel(value):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) and number >= 0 else None
+
+
 def _period_changed(
     period: str | None, last: datetime.datetime, now: datetime.datetime
 ) -> bool:
@@ -134,17 +146,19 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Replace implausible drops in cumulative counters with the last known-good value."""
         new_data = _strip_sentinels(new_data)
         for key, period in _CUMULATIVE_ENERGY_RESET_PERIOD.items():
-            if key not in new_data:
-                continue
-            try:
-                new_value = float(new_data[key])
-            except (TypeError, ValueError):
-                continue
             store_key = f"{scope}:{key}"
             last = self._last_good.get(store_key)
+            last_ts = dt_util.parse_datetime(last["ts"]) if last else None
+            same_period = last_ts is not None and not _period_changed(
+                period, last_ts, now
+            )
+            new_value = _valid_energy_value(new_data.get(key))
+            if new_value is None:
+                # Never present a previous period's counter as today's generation.
+                new_data[key] = last["value"] if last and same_period else None
+                continue
             if last is not None and new_value < last["value"] * _GLITCH_DROP_RATIO:
-                last_ts = dt_util.parse_datetime(last["ts"])
-                if last_ts is not None and not _period_changed(period, last_ts, now):
+                if same_period:
                     _LOGGER.warning(
                         "Ignoring implausible reading for %s (%s): %s -> %s "
                         "(keeping last known-good value)",
@@ -191,9 +205,13 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         cached_systems = self.config_entry.data.get(CONF_CACHED_SYSTEMS)
         cached_devices = self.config_entry.data.get(CONF_CACHED_DEVICES, {})
         self._last_good = {
-            k: v
+            k: {"value": _valid_energy_value(v.get("value")), "ts": v["ts"]}
             for k, v in (await self._store.async_load() or {}).items()
-            if not _is_sentinel(v.get("value"))
+            if isinstance(v, dict)
+            and _valid_energy_value(v.get("value")) is not None
+            and isinstance(v.get("ts"), str)
+            and (timestamp := dt_util.parse_datetime(v["ts"])) is not None
+            and timestamp.tzinfo is not None
         }
 
         try:
@@ -293,10 +311,16 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         now,
                     )
                 except SigenergyTransientError:
-                    system_data["summary"] = prev.get("summary", {})
+                    system_data["summary"] = self._sanitize_cumulative_values(
+                        system_id, {}, now
+                    )
+                except (SigenergyAuthError, SigenergyRateLimitError):
+                    raise
                 except SigenergyApiError as err:
                     _LOGGER.debug("Error fetching summary for %s: %s", system_id, err)
-                    system_data["summary"] = prev.get("summary", {})
+                    system_data["summary"] = self._sanitize_cumulative_values(
+                        system_id, {}, now
+                    )
 
                 try:
                     system_data["energy_flow"] = _strip_sentinels(
@@ -304,6 +328,8 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     )
                 except SigenergyTransientError:
                     system_data["energy_flow"] = prev.get("energy_flow", {})
+                except (SigenergyAuthError, SigenergyRateLimitError):
+                    raise
                 except SigenergyApiError as err:
                     _LOGGER.debug(
                         "Error fetching energy flow for %s: %s", system_id, err
@@ -317,6 +343,8 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     )
                 except SigenergyTransientError:
                     system_data["operating_mode"] = prev.get("operating_mode")
+                except (SigenergyAuthError, SigenergyRateLimitError):
+                    raise
                 except SigenergyApiError as err:
                     _LOGGER.debug(
                         "Error fetching operating mode for %s: %s", system_id, err
@@ -341,14 +369,30 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             ),
                         }
                     except SigenergyTransientError:
-                        if serial in prev_devices:
-                            system_data["devices"][serial] = prev_devices[serial]
+                        system_data["devices"][serial] = {
+                            "info": device,
+                            "realtime": {
+                                **prev_devices.get(serial, {}).get("realtime", {}),
+                                **self._sanitize_cumulative_values(
+                                    f"{system_id}:{serial}", {}, now
+                                ),
+                            },
+                        }
+                    except (SigenergyAuthError, SigenergyRateLimitError):
+                        raise
                     except SigenergyApiError as err:
                         _LOGGER.debug(
                             "Error fetching device %s data: %s", serial, err
                         )
-                        if serial in prev_devices:
-                            system_data["devices"][serial] = prev_devices[serial]
+                        system_data["devices"][serial] = {
+                            "info": device,
+                            "realtime": {
+                                **prev_devices.get(serial, {}).get("realtime", {}),
+                                **self._sanitize_cumulative_values(
+                                    f"{system_id}:{serial}", {}, now
+                                ),
+                            },
+                        }
 
                 result["systems"][system_id] = system_data
 
