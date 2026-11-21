@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import timedelta
 import datetime
 import logging
+import math
 from typing import Any
 
 from homeassistant.components import persistent_notification
@@ -12,6 +13,7 @@ from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
@@ -46,6 +48,76 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Cumulative energy counters (used by TOTAL_INCREASING sensors) mapped to the
+# period at which they are legitimately allowed to reset to a lower value.
+# `None` means the counter is lifetime and must never decrease.
+# The cloud API occasionally returns a corrupted reading (e.g. the value
+# divided by 100) for these fields; because TOTAL_INCREASING sensors treat
+# any drop as a meter reset, a single bad sample permanently corrupts HA's
+# long-term statistics unless it is filtered out before being stored.
+_CUMULATIVE_ENERGY_RESET_PERIOD: dict[str, str | None] = {
+    "dailyPowerGeneration": "daily",
+    "monthlyPowerGeneration": "monthly",
+    "annualPowerGeneration": "annual",
+    "lifetimePowerGeneration": None,
+    "pvEnergyDaily": "daily",
+    "pvEnergyTotal": None,
+    "esChargingDay": "daily",
+    "esDischargingDay": "daily",
+    "esDischargingTotal": None,
+}
+
+# A drop below this fraction of the previous value is treated as an
+# implausible glitch rather than a genuine counter reset.
+_GLITCH_DROP_RATIO = 0.5
+
+_STORAGE_VERSION = 1
+
+# 0xFFFFFFFF at the API's decimal scales; Sigenergy uses it to mean "not available".
+_INVALID_SENTINELS = frozenset({4294967295.0, 429496729.5, 42949672.95, 4294967.295})
+
+
+def _is_sentinel(value: Any) -> bool:
+    """Return True if `value` is the API's "not available" marker."""
+    try:
+        return float(value) in _INVALID_SENTINELS
+    except (TypeError, ValueError):
+        return False
+
+
+def _strip_sentinels(data: dict[str, Any]) -> dict[str, Any]:
+    """Replace "not available" markers with None."""
+    return {k: None if _is_sentinel(v) else v for k, v in data.items()}
+
+
+def _valid_energy_value(value: Any) -> float | None:
+    """Return a finite, nonnegative energy reading, excluding sentinel values."""
+    if isinstance(value, bool) or _is_sentinel(value):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) and number >= 0 else None
+
+
+def _period_changed(
+    period: str | None, last: datetime.datetime, now: datetime.datetime
+) -> bool:
+    """Return True if a reset boundary for `period` lies between `last` and `now`."""
+    if period is None:
+        return False
+    a = dt_util.as_local(last)
+    b = dt_util.as_local(now)
+    if period == "daily":
+        return a.date() != b.date()
+    if period == "monthly":
+        return (a.year, a.month) != (b.year, b.month)
+    if period == "annual":
+        return a.year != b.year
+    return False
+
+
 class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Coordinator to manage fetching Sigenergy data from the cloud API."""
 
@@ -68,6 +140,47 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # endpoint's rate limit with the sensors and alternate with them.
         self.backfill_jobs: dict[str, BackfillJob] = {}
         self._backfill_turn = False
+        # Persisted so validation survives HA restarts and data gaps.
+        self._store: Store[d
+                           ict[str, dict[str, Any]]] = Store(
+            hass, _STORAGE_VERSION, f"{DOMAIN}.{entry.entry_id}.last_good"
+        )
+        self._last_good: dict[str, dict[str, Any]] = {}
+
+    def _sanitize_cumulative_values(
+        self,
+        scope: str,
+        new_data: dict[str, Any],
+        now: datetime.datetime,
+    ) -> dict[str, Any]:
+        """Replace implausible drops in cumulative counters with the last known-good value."""
+        new_data = _strip_sentinels(new_data)
+        for key, period in _CUMULATIVE_ENERGY_RESET_PERIOD.items():
+            store_key = f"{scope}:{key}"
+            last = self._last_good.get(store_key)
+            last_ts = dt_util.parse_datetime(last["ts"]) if last else None
+            same_period = last_ts is not None and not _period_changed(
+                period, last_ts, now
+            )
+            new_value = _valid_energy_value(new_data.get(key))
+            if new_value is None:
+                # Never present a previous period's counter as today's generation.
+                new_data[key] = last["value"] if last and same_period else None
+                continue
+            if last is not None and new_value < last["value"] * _GLITCH_DROP_RATIO:
+                if same_period:
+                    _LOGGER.warning(
+                        "Ignoring implausible reading for %s (%s): %s -> %s "
+                        "(keeping last known-good value)",
+                        key,
+                        scope,
+                        last["value"],
+                        new_value,
+                    )
+                    new_data[key] = last["value"]
+                    continue
+            self._last_good[store_key] = {"value": new_value, "ts": now.isoformat()}
+        return new_data
 
     @staticmethod
     def _create_api(
@@ -101,6 +214,15 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         installation_id = self.config_entry.data.get(CONF_INSTALLATION_ID)
         cached_systems = self.config_entry.data.get(CONF_CACHED_SYSTEMS)
         cached_devices = self.config_entry.data.get(CONF_CACHED_DEVICES, {})
+        self._last_good = {
+            k: {"value": _valid_energy_value(v.get("value")), "ts": v["ts"]}
+            for k, v in (await self._store.async_load() or {}).items()
+            if isinstance(v, dict)
+            and _valid_energy_value(v.get("value")) is not None
+            and isinstance(v.get("ts"), str)
+            and (timestamp := dt_util.parse_datetime(v["ts"])) is not None
+            and timestamp.tzinfo is not None
+        }
 
         try:
             if installation_id:
@@ -221,6 +343,7 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._backfill_turn = not backfill_poll
             if not backfill_poll:
                 self._history_poll += 1
+            now = datetime.datetime.now(datetime.timezone.utc)
 
             for system in self.systems:
                 system_id = system["systemId"]
@@ -238,24 +361,36 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
                 # ── System-level realtime data ────────────────────
                 try:
-                    system_data["summary"] = await self.api.get_realtime_summary(
-                        system_id
+                    system_data["summary"] = self._sanitize_cumulative_values(
+                        system_id,
+                        await self.api.get_realtime_summary(system_id),
+                        now,
                     )
                 except SigenergyTransientError:
-                    system_data["summary"] = prev.get("summary", {})
+                    system_data["summary"] = self._sanitize_cumulative_values(
+                        system_id, {}, now
+                    )
+                except (SigenergyAuthError, SigenergyRateLimitError):
+                    raise
                 except SigenergyApiError as err:
                     _LOGGER.debug("Error fetching summary for %s: %s", system_id, err)
+                    system_data["summary"] = self._sanitize_cumulative_values(
+                        system_id, {}, now
+                    )
 
                 try:
-                    system_data["energy_flow"] = await self.api.get_energy_flow(
-                        system_id
+                    system_data["energy_flow"] = _strip_sentinels(
+                        await self.api.get_energy_flow(system_id)
                     )
                 except SigenergyTransientError:
                     system_data["energy_flow"] = prev.get("energy_flow", {})
+                except (SigenergyAuthError, SigenergyRateLimitError):
+                    raise
                 except SigenergyApiError as err:
                     _LOGGER.debug(
                         "Error fetching energy flow for %s: %s", system_id, err
                     )
+                    system_data["energy_flow"] = prev.get("energy_flow", {})
 
                 # ── Operating mode ────────────────────────────────
                 try:
@@ -264,10 +399,13 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     )
                 except SigenergyTransientError:
                     system_data["operating_mode"] = prev.get("operating_mode")
+                except (SigenergyAuthError, SigenergyRateLimitError):
+                    raise
                 except SigenergyApiError as err:
                     _LOGGER.debug(
                         "Error fetching operating mode for %s: %s", system_id, err
                     )
+                    system_data["operating_mode"] = prev.get("operating_mode")
 
                 # ── Energy history (one level per poll) ───────────
                 # Optional data: any failure, including rate limiting,
@@ -305,19 +443,42 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         )
                         system_data["devices"][serial] = {
                             "info": device,
-                            "realtime": device_data.get("realTimeInfo", {}),
+                            "realtime": self._sanitize_cumulative_values(
+                                f"{system_id}:{serial}",
+                                device_data.get("realTimeInfo", {}),
+                                now,
+                            ),
                         }
                     except SigenergyTransientError:
-                        if serial in prev_devices:
-                            system_data["devices"][serial] = prev_devices[serial]
+                        system_data["devices"][serial] = {
+                            "info": device,
+                            "realtime": {
+                                **prev_devices.get(serial, {}).get("realtime", {}),
+                                **self._sanitize_cumulative_values(
+                                    f"{system_id}:{serial}", {}, now
+                                ),
+                            },
+                        }
+                    except (SigenergyAuthError, SigenergyRateLimitError):
+                        raise
                     except SigenergyApiError as err:
                         _LOGGER.debug(
                             "Error fetching device %s data: %s", serial, err
                         )
+                        system_data["devices"][serial] = {
+                            "info": device,
+                            "realtime": {
+                                **prev_devices.get(serial, {}).get("realtime", {}),
+                                **self._sanitize_cumulative_values(
+                                    f"{system_id}:{serial}", {}, now
+                                ),
+                            },
+                        }
 
                 result["systems"][system_id] = system_data
 
-            result["last_updated"] = datetime.datetime.now(datetime.timezone.utc)
+            self._store.async_delay_save(lambda: self._last_good, 60)
+            result["last_updated"] = now
             return result
 
         except SigenergyAuthError as err:
