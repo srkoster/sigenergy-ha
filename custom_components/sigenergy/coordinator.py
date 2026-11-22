@@ -141,8 +141,7 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.backfill_jobs: dict[str, BackfillJob] = {}
         self._backfill_turn = False
         # Persisted so validation survives HA restarts and data gaps.
-        self._store: Store[d
-                           ict[str, dict[str, Any]]] = Store(
+        self._store: Store[dict[str, dict[str, Any]]] = Store(
             hass, _STORAGE_VERSION, f"{DOMAIN}.{entry.entry_id}.last_good"
         )
         self._last_good: dict[str, dict[str, Any]] = {}
