@@ -15,6 +15,7 @@ Home Assistant custom integration for **Sigenergy** solar inverters, batteries, 
 - **Device-level monitoring**: Per-inverter and per-meter data — voltages, currents, power factor, temperature, frequency
 - **Operating mode control**: Switch between Maximum Self-Consumption and Fully Feed-in to Grid
 - **Multi-system support**: All systems linked to your account are discovered automatically
+- **History backfill**: Import past daily energy history from the Sigenergy Cloud into Home Assistant's long-term statistics (`sigenergy.backfill_statistics`)
 - **Smart caching**: System and device lists are cached after the first fetch — no rate-limit issues on HA restart
 - **HA Energy Dashboard compatible**: Proper device classes for seamless Energy Dashboard integration
 
@@ -65,6 +66,11 @@ A **Sigenergy account** (username + password) for an installation where you are 
 | Monthly PV Generation | kWh | Energy generated this month |
 | Annual PV Generation | kWh | Energy generated this year |
 | Lifetime PV Generation | kWh | Total lifetime generation |
+| Grid Import Today / This Month / This Year / Total | kWh | Energy imported from the grid |
+| Grid Export Today / This Month / This Year / Total | kWh | Energy exported to the grid |
+| Battery Charging Today / This Month / This Year / Total | kWh | Energy charged into the battery |
+| Battery Discharging Today / This Month / This Year / Total | kWh | Energy discharged from the battery |
+| Home Consumption Today / This Month / This Year / Total | kWh | Household energy consumption |
 | Operating Mode | — | Current system operating mode |
 | Last Sync | timestamp | Time of last successful data fetch |
 
@@ -101,6 +107,10 @@ Select the region matching your Sigenergy account during setup:
 
 The Sigenergy Cloud API allows **1 request per endpoint per 5 minutes**. The integration polls every 5 minutes and caches the system/device list so restarts don't trigger extra API calls.
 
+Because of this limit, the energy history sensors (grid import/export, battery charging/discharging, home consumption) refresh one period per poll: the "Today" values every 10 minutes, the month, year and total values every 30 minutes. Right after a restart some of them show "unknown" until their first refresh.
+
+For the Energy Dashboard, use **Grid Import Total** / **Grid Export Total** for the grid and **Battery Charging Total** / **Battery Discharging Total** for the battery.
+
 ## Troubleshooting
 
 | Error | Cause | Fix |
@@ -109,6 +119,7 @@ The Sigenergy Cloud API allows **1 request per endpoint per 5 minutes**. The int
 | "Authentication failed" | Wrong credentials or expired token | Reconfigure via Settings → Devices & Services |
 | No devices / entities | System not yet discovered | Check HA logs; delete and re-add the integration |
 | New system not showing up | System list is cached after first fetch | Call the `sigenergy.refresh_systems` service (see below) |
+| Energy Dashboard starts at the day the integration was installed | HA only has statistics from that day on | Call the `sigenergy.backfill_statistics` service (see below) |
 
 ### Discovering a newly-added system
 
@@ -126,6 +137,52 @@ service: sigenergy.refresh_systems
 
 The service clears the cached system/device list and reloads the integration,
 which triggers a fresh API call for your full system inventory.
+
+### Importing past history (backfill)
+
+Home Assistant only has statistics from the day an energy sensor was added.
+The **`sigenergy.backfill_statistics`** service imports the daily history stored
+in the Sigenergy Cloud for earlier days into Home Assistant's long-term
+statistics, so the Energy Dashboard and statistics cards show them too.
+
+```yaml
+service: sigenergy.backfill_statistics
+data:
+  start_date: "2024-01-01"
+  end_date: "2026-10-13"
+  # system_id: NDXZZ1731665796   # optional, defaults to all systems
+```
+
+What gets imported, as one value per day:
+
+| Sensor | Sigenergy history value |
+|--------|-------------------------|
+| Grid Import Total | Energy bought from the grid |
+| Grid Export Total | Energy sold to the grid |
+| Battery Charging Total | Battery charging energy |
+| Battery Discharging Total | Battery discharging energy |
+| Home Consumption Total | Household consumption |
+| Lifetime PV Generation | PV generation |
+
+How it works:
+
+- **Runs in the background.** The history endpoint allows one request per
+  system every 5 minutes, so the service only queues the work. Each request
+  fetches a whole month of daily values, and backfill requests alternate with
+  the regular history refresh: expect **about 10 minutes per month** (a year
+  takes about 2 hours). The service response contains the number of months
+  and an estimate. A notification appears when the import is finished.
+- **Never overwrites recorded data.** For each sensor only the days *before*
+  its first recorded statistic are imported; everything later is shifted so the
+  totals continue seamlessly. Running the service again for the same range does
+  nothing, and you can extend the range further back at any time.
+- **Daily resolution.** Each day's energy is stored in the midnight hour, so the
+  dashboard's day, week, month and year views are correct, but the hourly view
+  shows each backfilled day as one bar at midnight.
+- The sensors need to have statistics already (wait an hour after adding the
+  integration). Today and the day the sensor was added are not imported.
+- If Home Assistant restarts during a backfill, call the service again with
+  the same dates; the months already imported are skipped.
 
 ## Support
 

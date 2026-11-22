@@ -7,6 +7,7 @@ import logging
 import math
 from typing import Any
 
+from homeassistant.components import persistent_notification
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
@@ -26,6 +27,7 @@ from .api import (
     SigenergyRateLimitError,
     SigenergyTransientError,
 )
+from .backfill import BackfillJob
 from .const import (
     API_BASE_URL,
     AUTH_METHOD_KEY,
@@ -39,6 +41,8 @@ from .const import (
     CONF_REGION,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    HISTORY_LEVEL_LIFETIME,
+    HISTORY_LEVEL_ROTATION,
     REGION_URLS,
 )
 
@@ -131,6 +135,11 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.api = self._create_api(hass, entry)
         self.systems: list[dict[str, Any]] = []
         self.devices: dict[str, list[dict[str, Any]]] = {}
+        self._history_poll = 0
+        # Statistics backfills, keyed by system id. They share the history
+        # endpoint's rate limit with the sensors and alternate with them.
+        self.backfill_jobs: dict[str, BackfillJob] = {}
+        self._backfill_turn = False
         # Persisted so validation survives HA restarts and data gaps.
         self._store: Store[dict[str, dict[str, Any]]] = Store(
             hass, _STORAGE_VERSION, f"{DOMAIN}.{entry.entry_id}.last_good"
@@ -280,6 +289,43 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return self.data.get("systems", {}).get(system_id, {})
         return {}
 
+    def async_start_backfill(self, job: BackfillJob) -> None:
+        """Queue a statistics backfill; its first month is fetched next poll."""
+        self.backfill_jobs[job.system_id] = job
+        self._backfill_turn = True
+
+    async def _async_backfill_step(self, system_id: str) -> None:
+        """Fetch and import the next month of a statistics backfill."""
+        job = self.backfill_jobs[system_id]
+        try:
+            await job.async_step(self.hass, self.api)
+        except SigenergyAuthError:
+            raise
+        except (SigenergyRateLimitError, SigenergyTransientError) as err:
+            _LOGGER.debug("Backfill for %s retries next time: %s", system_id, err)
+        except SigenergyApiError as err:
+            _LOGGER.debug("Backfill request for %s failed: %s", system_id, err)
+            job.record_failure()
+        except Exception:
+            _LOGGER.exception("Statistics backfill for %s failed", system_id)
+            del self.backfill_jobs[system_id]
+            return
+
+        if job.done:
+            del self.backfill_jobs[system_id]
+            imported = {t.statistic_id: t.imported_days for t in job.targets}
+            _LOGGER.info(
+                "Statistics backfill for %s finished, days imported: %s",
+                system_id, imported,
+            )
+            persistent_notification.async_create(
+                self.hass,
+                "Imported daily history into:\n"
+                + "\n".join(f"- {sid}: {days} days" for sid, days in imported.items()),
+                title="Sigenergy statistics backfill finished",
+                notification_id=f"{DOMAIN}_backfill_{system_id}",
+            )
+
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from the Sigenergy API.
 
@@ -289,6 +335,13 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         try:
             result: dict[str, Any] = {"systems": {}}
+            history_level = HISTORY_LEVEL_ROTATION[
+                self._history_poll % len(HISTORY_LEVEL_ROTATION)
+            ]
+            backfill_poll = bool(self.backfill_jobs) and self._backfill_turn
+            self._backfill_turn = not backfill_poll
+            if not backfill_poll:
+                self._history_poll += 1
             now = datetime.datetime.now(datetime.timezone.utc)
 
             for system in self.systems:
@@ -301,6 +354,8 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "energy_flow": {},
                     "operating_mode": None,
                     "devices": {},
+                    # Keep the levels not refreshed this poll
+                    "history": dict(prev.get("history", {})),
                 }
 
                 # ── System-level realtime data ────────────────────
@@ -350,6 +405,31 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "Error fetching operating mode for %s: %s", system_id, err
                     )
                     system_data["operating_mode"] = prev.get("operating_mode")
+
+                # ── Energy history (one level per poll) ───────────
+                # Optional data: any failure, including rate limiting,
+                # keeps the previous values instead of failing the update.
+                if backfill_poll and system_id in self.backfill_jobs:
+                    await self._async_backfill_step(system_id)
+                else:
+                    try:
+                        date = (
+                            None
+                            if history_level == HISTORY_LEVEL_LIFETIME
+                            else dt_util.now().date().isoformat()
+                        )
+                        system_data["history"][history_level] = (
+                            await self.api.get_system_history(
+                                system_id, history_level, date
+                            )
+                        )
+                    except SigenergyAuthError:
+                        raise
+                    except SigenergyApiError as err:
+                        _LOGGER.debug(
+                            "Error fetching %s history for %s: %s",
+                            history_level, system_id, err,
+                        )
 
                 # ── Device-level realtime data ────────────────────
                 prev_devices = prev.get("devices", {})

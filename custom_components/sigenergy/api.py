@@ -22,6 +22,7 @@ from .const import (
     REALTIME_SUMMARY_URL,
     SWITCH_MODE_URL,
     SYSTEM_LIST_URL,
+    SYSTEM_HISTORY_URL,
     SYSTEM_LIST_PAGE_URL,
     TOKEN_EXPIRY_BUFFER,
 )
@@ -284,6 +285,35 @@ class SigenergyApi:
             url, {"systemId": system_id, "serialNumber": serial_number}
         )
         return self._parse_data(data.get("data", {})) or {}
+
+    # ── Historical Data ────────────────────────────────────────
+
+    async def get_system_history(
+        self,
+        system_id: str,
+        level: str,
+        date: str | None = None,
+        include_items: bool = False,
+    ) -> dict[str, Any]:
+        """Get aggregated energy statistics for a system.
+
+        `level` is Day, Week, Month, Year or Lifetime; `date` (yyyy-MM-dd)
+        is required for every level except Lifetime. The per-interval
+        `itemList` is dropped unless `include_items` is set.
+        """
+        url = SYSTEM_HISTORY_URL.format(system_id=system_id)
+        params = {"systemId": system_id, "level": level}
+        if date is not None:
+            params["date"] = date
+        data = await self._api_get(url, params)
+        result = self._parse_data(data.get("data", {}))
+        if not isinstance(result, dict):
+            return {}
+        if include_items:
+            result["itemList"] = self._parse_data(result.get("itemList")) or []
+        else:
+            result.pop("itemList", None)
+        return result
 
     # ── Instructions ───────────────────────────────────────────
 
